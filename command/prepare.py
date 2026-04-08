@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import typing
 
@@ -65,6 +66,20 @@ def resolve_xlink(input_file: str, output_file: str) -> None:
         output_file (str): path to the resolved CityGML file (*.gml)
     """
     doc = etree.parse(input_file)
+    ref_elms = doc.findall(
+        '//*[@xlink:href]',
+        namespaces={
+            'xlink': 'http://www.w3.org/1999/xlink',
+        }
+    )
+    href_ids = set()
+    for elm in ref_elms:
+        href = elm.attrib['{http://www.w3.org/1999/xlink}href']
+        if href and href.startswith('#'):
+            href_ids.add(href[1:])
+    if not href_ids:
+        shutil.copyfile(input_file, output_file)
+        return
     id_elms = doc.findall(
         '//*[@gml:id]',
         namespaces={
@@ -74,6 +89,8 @@ def resolve_xlink(input_file: str, output_file: str) -> None:
     id_map = {}
     for id_elm in id_elms:
         gml_id = id_elm.attrib['{http://www.opengis.net/gml}id']
+        if gml_id not in href_ids:
+            continue
         elm_copy = copy.deepcopy(id_elm)
         del elm_copy.attrib['{http://www.opengis.net/gml}id']
         id_elms_copy = elm_copy.findall(
@@ -85,12 +102,6 @@ def resolve_xlink(input_file: str, output_file: str) -> None:
         for id_elm_copy in id_elms_copy:
             del id_elm_copy.attrib['{http://www.opengis.net/gml}id']
         id_map[gml_id] = elm_copy
-    ref_elms = doc.findall(
-        '//*[@xlink:href]',
-        namespaces={
-            'xlink': 'http://www.w3.org/1999/xlink',
-        }
-    )
     for elm in ref_elms:
         href = elm.attrib['{http://www.w3.org/1999/xlink}href']
         if href[0] != '#':
@@ -121,6 +132,29 @@ def extract_geometry(input_file: str, output_file: str, lod: int, crs: int,
         crs (int): coordinate reference system of the output features
         ids (Tuple[str]): gml:ids which will be filtered
     """
+    features = extract_geometry_iter(input_file, lod, crs, ids)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('{"type":"FeatureCollection","features":[')
+        for idx, feature in enumerate(features):
+            if idx:
+                f.write(',')
+            json.dump(feature, f)
+        f.write(']}')
+
+
+def extract_geometry_iter(input_file: str, lod: int, crs: int,
+                          ids: Tuple[str]) -> Iterator[Dict[str, Any]]:
+    """extract geometries from the specified CityGML as an iterator
+
+    Args:
+        input_file (str): path to the resolved CityGML file (*.gml)
+        lod (int): maximum LOD of target geometries
+        crs (int): coordinate reference system of the output features
+        ids (Tuple[str]): gml:ids which will be filtered
+
+    Yields:
+        Iterator[Dict[str, Any]]: feature-like dict
+    """
     id_set = set(ids or [])
     doc = etree.parse(input_file)
     root = doc.getroot()
@@ -130,11 +164,6 @@ def extract_geometry(input_file: str, output_file: str, lod: int, crs: int,
             'gml': 'http://www.opengis.net/gml',
         }
     )
-    features = []
-    feature_collection = {
-        'type': 'FeatureCollection',
-        'features': features,
-    }
     crs_from = proj.CRS.from_epsg(4326)
     crs_to = proj.CRS.from_epsg(crs)
     transformer = proj.Transformer.from_crs(crs_from, crs_to, always_xy=True)
@@ -178,9 +207,9 @@ def extract_geometry(input_file: str, output_file: str, lod: int, crs: int,
             exterior = []
             interiors = []
             for pos in pos_list:
-                is_interior= etree.QName(pos.getparent().getparent().tag).localname == 'interior'
+                is_interior = etree.QName(pos.getparent().getparent().tag).localname == 'interior'
                 if exterior and not is_interior:
-                    features.append({
+                    yield {
                         'type': 'Feature',
                         'properties': {
                             'gml_id': gml_id,
@@ -192,24 +221,20 @@ def extract_geometry(input_file: str, output_file: str, lod: int, crs: int,
                             'type': geom_type,
                             'coordinates': [exterior, *interiors],
                         }
-                    })
+                    }
                     exterior = []
                     interiors = []
-                interior = []
-                coordinates = [float(p) for p in pos.text.split(' ')]
-                while coordinates:
-                    lat = coordinates.pop(0)
-                    lon = coordinates.pop(0)
-                    z = coordinates.pop(0)
-                    x, y = transformer.transform(lon, lat)
-                    if is_interior:
-                        interior.append([x, y, z])
-                    else:
-                        exterior.append([x, y, z])
-                if is_interior and interior:
-                    interiors.append(interior)
+
+                transformed = _transform_pos_list(pos.text, transformer)
+                if not transformed:
+                    continue
+                if is_interior:
+                    interiors.append(transformed)
+                else:
+                    exterior.extend(transformed)
+
             if exterior or interiors:
-                features.append({
+                yield {
                     'type': 'Feature',
                     'properties': {
                         'gml_id': gml_id,
@@ -221,10 +246,21 @@ def extract_geometry(input_file: str, output_file: str, lod: int, crs: int,
                         'type': geom_type,
                         'coordinates': [exterior, *interiors],
                     }
-                })
+                }
 
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(feature_collection, f)
+
+def _transform_pos_list(pos_text: str, transformer: proj.Transformer) -> List[List[float]]:
+    """Vectorized coordinate transform for gml:posList."""
+    if not pos_text:
+        return []
+    coordinates = [float(p) for p in pos_text.split(' ')]
+    if len(coordinates) % 3 != 0:
+        raise ValueError(f'Invalid coordinates length: {len(coordinates)}')
+    lats = coordinates[0::3]
+    lons = coordinates[1::3]
+    zs = coordinates[2::3]
+    xs, ys = transformer.transform(lons, lats)
+    return [[x, y, z] for x, y, z in zip(xs, ys, zs)]
 
 
 def get_geometry_paths(fc_name: str) -> Dict[int, Set[Tuple[str, int]]]:
@@ -267,7 +303,7 @@ def arrange_path(path: str) -> Tuple[int, str]:
     if path[:3] != './/':
         path = './/' + path
     path = re.sub(r'/(\w)', r'/{*}\1', path)
-    m = re.search(r'lod([0-3])', path)
+    m = re.search(r'lod(\d+)', path)
     if m:
         lod = int(m.group(1))
     else:

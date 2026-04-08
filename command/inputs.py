@@ -62,21 +62,19 @@ def load_features(input_file: str, ids: Tuple[str], lod: int, crs: int,
     Yields:
         Iterator[Tuple[List[List[List[float]]], Dict[str, Any]]]: features
     """
-    fd, geojson_file = tempfile.mkstemp('.json')
-    os.close(fd)
-
-    prepare.main(
-        input_file,
-        geojson_file,
-        lod=lod,
-        crs=crs,
-        ids=ids,
-        debug=debug
-    )
-
-    with open(geojson_file, encoding='utf-8') as f:
-        dataset = json.load(f)
-        for feature in dataset['features']:
+    fd_resolved, resolved_file = tempfile.mkstemp('.gml')
+    os.close(fd_resolved)
+    geojson_file = None
+    cached_features = []
+    try:
+        prepare.resolve_xlink(input_file, resolved_file)
+        feature_iter = prepare.extract_geometry_iter(
+            resolved_file,
+            lod=lod,
+            crs=crs,
+            ids=ids
+        )
+        for feature in feature_iter:
             props = feature['properties']
             ft_geom = feature['geometry']
             geom_type = ft_geom['type']
@@ -90,12 +88,28 @@ def load_features(input_file: str, ids: Tuple[str], lod: int, crs: int,
                 geoms = [[ft_geom['coordinates']]]
             else:
                 raise ValueError(f'Invalid geometry type: {geom_type}')
+            if debug:
+                cached_features.append(feature)
             for geom in geoms:
                 yield geom, props
 
-    logger.debug(f'geojson file: {geojson_file}')
-    if not debug:
-        os.remove(geojson_file)
+        if debug:
+            fd_geojson, geojson_file = tempfile.mkstemp('.json')
+            os.close(fd_geojson)
+            with open(geojson_file, 'w', encoding='utf-8') as f:
+                json.dump(
+                    {
+                        'type': 'FeatureCollection',
+                        'features': cached_features
+                    },
+                    f
+                )
+    finally:
+        logger.debug(f'resolved file: {resolved_file}')
+        if not debug and os.path.exists(resolved_file):
+            os.remove(resolved_file)
+        if debug and geojson_file:
+            logger.debug(f'geojson file: {geojson_file}')
 
 
 def load_ids(input_file: str, ids: Tuple[str] = None
